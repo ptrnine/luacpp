@@ -1,5 +1,5 @@
 set(LUA_VARIANT "luajit" CACHE STRING "Lua variant, can be lua or luajit")
-set(LUA_GIT_VERSION "v2.1.ROLLING" CACHE STRING "Lua version from git repository")
+set(LUA_GIT_VERSION "" CACHE STRING "Lua version from git repository (empty: the submodule commit)")
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(_cxx_flags

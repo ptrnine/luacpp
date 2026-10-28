@@ -62,13 +62,15 @@ macro(git_submodule_make_build _project_name)
         cmake_parse_arguments(${_project_name} "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
         # Checkout specified version
-        execute_process(COMMAND git checkout "${${_project_name}_GIT_VERSION}"
-                RESULT_VARIABLE result
-                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/submodules/${_project_name}"
-        )
+        if (${_project_name}_GIT_VERSION)
+            execute_process(COMMAND git checkout "${${_project_name}_GIT_VERSION}"
+                    RESULT_VARIABLE result
+                    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/submodules/${_project_name}"
+            )
 
-        if(result)
-            message(FATAL_ERROR "Failed to checkout version ${${_project_name}_GIT_VERSION} ${_project_name}")
+            if(result)
+                message(FATAL_ERROR "Failed to checkout version ${${_project_name}_GIT_VERSION} ${_project_name}")
+            endif()
         endif()
 
         # Apply patches
