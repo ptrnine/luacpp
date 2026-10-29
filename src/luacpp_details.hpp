@@ -635,14 +635,12 @@ T luaget(lua_State* l, int idx) {
     if (lua_type(l, idx) != LUA_TUSERDATA)
         throw errors::cast_error(l, idx, "this type can't be casted to C++ userdata type", __PRETTY_FUNCTION__);
 
-    using rt_t = std::remove_reference_t<T>;
-
     /* interpretation A: T is (a reference to) the registered typespec itself */
     constexpr bool     a_ok   = LuaRegisteredType<std::decay_t<T>>;
     constexpr size_t   a_size = sizeof(uint64_t) + sizeof(std::decay_t<T>);
-    /* interpretation B: T points into the payload of the pointed-to typespec's userdata */
-    constexpr bool     b_ok   = std::is_pointer_v<rt_t> && LuaRegisteredType<std::remove_pointer_t<rt_t>>;
-    constexpr size_t   b_size = sizeof(uint64_t) + sizeof(std::remove_pointer_t<rt_t>);
+    /* interpretation B: T is a raw pointer into the payload of the pointed-to typespec's userdata */
+    constexpr bool     b_ok   = std::is_pointer_v<T> && LuaRegisteredType<std::remove_pointer_t<T>>;
+    constexpr size_t   b_size = sizeof(uint64_t) + sizeof(std::remove_pointer_t<T>);
 
     size_t   objlen = lua_objlen(l, idx);
     /* TODO: check address alignment for this */
@@ -652,7 +650,7 @@ T luaget(lua_State* l, int idx) {
 
     bool a_match = a_ok && objlen == a_size && type_registry::get_index<std::decay_t<T>>() == type_index;
     bool b_match =
-        b_ok && objlen == b_size && type_registry::get_index<std::remove_pointer_t<rt_t>>() == type_index;
+        b_ok && objlen == b_size && type_registry::get_index<std::remove_pointer_t<T>>() == type_index;
 
     if (!a_match && !b_match) {
         std::string expected;
@@ -661,7 +659,7 @@ T luaget(lua_State* l, int idx) {
         if constexpr (b_ok) {
             if (!expected.empty())
                 expected += " or ";
-            expected += type_registry::get_typespec<std::remove_pointer_t<rt_t>>().lua_name().data();
+            expected += type_registry::get_typespec<std::remove_pointer_t<T>>().lua_name().data();
         }
         throw errors::cast_error(
             l,
@@ -670,24 +668,25 @@ T luaget(lua_State* l, int idx) {
             __PRETTY_FUNCTION__);
     }
 
-    using pointer_t = std::conditional_t<std::is_pointer_v<T>, T, std::decay_t<T>*>;
+    /* A: T is (a reference to) the registered typespec — return (a reference to) the stored payload */
+    auto data = reinterpret_cast<std::decay_t<T>*>(reinterpret_cast<char*>(ptr) + sizeof(uint64_t)); // NOLINT
+    if (a_match)
+        return *data;
 
-    auto data = reinterpret_cast<pointer_t>(reinterpret_cast<char*>(ptr) + sizeof(uint64_t)); // NOLINT
-
+    /* B: T is a raw pointer one level into the payload (e.g. the __gc handlers
+     * register_usertypes registers) — return it; unreachable for non-pointer T */
     if constexpr (std::is_pointer_v<T>)
-        return data;
+        return reinterpret_cast<T>(reinterpret_cast<char*>(ptr) + sizeof(uint64_t)); // NOLINT
     else
         return *data;
 }
 
 template <LuaRegisteredTypeRefOrPtr T>
 bool luacheck(lua_State* l, int idx) {
-    using rt_t = std::remove_reference_t<T>;
-
     constexpr bool   a_ok   = LuaRegisteredType<std::decay_t<T>>;
     constexpr size_t a_size = sizeof(uint64_t) + sizeof(std::decay_t<T>);
-    constexpr bool   b_ok   = std::is_pointer_v<rt_t> && LuaRegisteredType<std::remove_pointer_t<rt_t>>;
-    constexpr size_t b_size = sizeof(uint64_t) + sizeof(std::remove_pointer_t<rt_t>);
+    constexpr bool   b_ok   = std::is_pointer_v<T> && LuaRegisteredType<std::remove_pointer_t<T>>;
+    constexpr size_t b_size = sizeof(uint64_t) + sizeof(std::remove_pointer_t<T>);
 
     if (lua_type(l, idx) != LUA_TUSERDATA)
         return false;
@@ -699,7 +698,7 @@ bool luacheck(lua_State* l, int idx) {
 
     bool a_match = a_ok && objlen == a_size && type_registry::get_index<std::decay_t<T>>() == type_index;
     bool b_match =
-        b_ok && objlen == b_size && type_registry::get_index<std::remove_pointer_t<rt_t>>() == type_index;
+        b_ok && objlen == b_size && type_registry::get_index<std::remove_pointer_t<T>>() == type_index;
 
     return a_match || b_match;
 }
