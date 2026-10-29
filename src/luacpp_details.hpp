@@ -154,7 +154,11 @@ bool luacheck(lua_State* l, int idx);
 struct placeholder {};
 inline void luapush(lua_State*, placeholder) {}
 
-inline void luapush(lua_State* l, std::type_identity_t<bool> value) {
+/* constrained to actual booleans: an unqualified bool parameter also accepts anything
+ * contextually convertible (lambdas, via nullptr_t), which silently registered true */
+template <typename T>
+    requires std::same_as<std::decay_t<T>, bool>
+void luapush(lua_State* l, T value) {
     lua_pushboolean(l, value);
 }
 
@@ -620,35 +624,53 @@ bool luacheck(lua_State* l, int idx) {
     return result;
 }
 
-/* This is the only thing that can return references */
+/* This is the only thing that can return references.
+ * A userdata of a registered type holds (type index + payload), the payload being
+ * the object for value types and the pointer itself for pointer types. T may be
+ * the registered type (or a reference to it), or a pointer one level into the
+ * payload (e.g. the __gc handlers registered by register_usertypes), so match
+ * both interpretations and require the stored index to agree. */
 template <LuaRegisteredTypeRefOrPtr T>
 T luaget(lua_State* l, int idx) {
     if (lua_type(l, idx) != LUA_TUSERDATA)
         throw errors::cast_error(l, idx, "this type can't be casted to C++ userdata type", __PRETTY_FUNCTION__);
 
-    size_t           objlen  = lua_objlen(l, idx);
-    constexpr size_t reallen = sizeof(uint64_t) + sizeof(std::remove_pointer_t<T>);
-    if (objlen != reallen)
-        throw errors::cast_error(l,
-                                 idx,
-                                 "userdata has invalid length (" + std::to_string(objlen) + " but should be " +
-                                     std::to_string(reallen) + ") ",
-                                 __PRETTY_FUNCTION__);
+    using rt_t = std::remove_reference_t<T>;
 
+    /* interpretation A: T is (a reference to) the registered typespec itself */
+    constexpr bool     a_ok   = LuaRegisteredType<std::decay_t<T>>;
+    constexpr size_t   a_size = sizeof(uint64_t) + sizeof(std::decay_t<T>);
+    /* interpretation B: T points into the payload of the pointed-to typespec's userdata */
+    constexpr bool     b_ok   = std::is_pointer_v<rt_t> && LuaRegisteredType<std::remove_pointer_t<rt_t>>;
+    constexpr size_t   b_size = sizeof(uint64_t) + sizeof(std::remove_pointer_t<rt_t>);
+
+    size_t   objlen = lua_objlen(l, idx);
     /* TODO: check address alignment for this */
     void*    ptr = lua_touserdata(l, idx);
     uint64_t type_index;
     std::memcpy(&type_index, ptr, sizeof(type_index));
 
-    using pointer_t = std::conditional_t<std::is_pointer_v<T>, T, std::decay_t<T>*>;
+    bool a_match = a_ok && objlen == a_size && type_registry::get_index<std::decay_t<T>>() == type_index;
+    bool b_match =
+        b_ok && objlen == b_size && type_registry::get_index<std::remove_pointer_t<rt_t>>() == type_index;
 
-    if (type_registry::get_index<std::remove_pointer_t<pointer_t>>() != type_index)
+    if (!a_match && !b_match) {
+        std::string expected;
+        if constexpr (a_ok)
+            expected += type_registry::get_typespec<std::decay_t<T>>().lua_name().data();
+        if constexpr (b_ok) {
+            if (!expected.empty())
+                expected += " or ";
+            expected += type_registry::get_typespec<std::remove_pointer_t<rt_t>>().lua_name().data();
+        }
         throw errors::cast_error(
             l,
             idx,
-            "userdata is not a " +
-                std::string(type_registry::get_typespec<std::remove_pointer_t<pointer_t>>().lua_name().data()),
+            "userdata is not a " + expected + " (userdata has invalid length (" + std::to_string(objlen) + ")) ",
             __PRETTY_FUNCTION__);
+    }
+
+    using pointer_t = std::conditional_t<std::is_pointer_v<T>, T, std::decay_t<T>*>;
 
     auto data = reinterpret_cast<pointer_t>(reinterpret_cast<char*>(ptr) + sizeof(uint64_t)); // NOLINT
 
@@ -660,14 +682,26 @@ T luaget(lua_State* l, int idx) {
 
 template <LuaRegisteredTypeRefOrPtr T>
 bool luacheck(lua_State* l, int idx) {
-    if (lua_type(l, idx) != LUA_TUSERDATA || lua_objlen(l, idx) != sizeof(uint64_t) + sizeof(std::remove_pointer_t<T>))
+    using rt_t = std::remove_reference_t<T>;
+
+    constexpr bool   a_ok   = LuaRegisteredType<std::decay_t<T>>;
+    constexpr size_t a_size = sizeof(uint64_t) + sizeof(std::decay_t<T>);
+    constexpr bool   b_ok   = std::is_pointer_v<rt_t> && LuaRegisteredType<std::remove_pointer_t<rt_t>>;
+    constexpr size_t b_size = sizeof(uint64_t) + sizeof(std::remove_pointer_t<rt_t>);
+
+    if (lua_type(l, idx) != LUA_TUSERDATA)
         return false;
 
+    size_t   objlen = lua_objlen(l, idx);
     void*    ptr = lua_touserdata(l, idx);
     uint64_t type_index;
     std::memcpy(&type_index, ptr, sizeof(type_index));
 
-    return type_registry::get_index<std::decay_t<std::remove_pointer_t<T>>>() == type_index;
+    bool a_match = a_ok && objlen == a_size && type_registry::get_index<std::decay_t<T>>() == type_index;
+    bool b_match =
+        b_ok && objlen == b_size && type_registry::get_index<std::remove_pointer_t<rt_t>>() == type_index;
+
+    return a_match || b_match;
 }
 
 template <typename F, typename RF, uint64_t UniqId>
@@ -806,16 +840,20 @@ namespace details
 } // namespace details
 
 template <typename T>
-concept LuaFunctionLike = details::LuaFunctional<T> || std::is_function_v<T>;
+/* decay T: lvalue lambdas deduce F as closure& in F&& parameters, and
+ * &closure&::operator() is ill-formed without decay, which silently routed them
+ * to the generic value overload (and luapush registered them as booleans) */
+concept LuaFunctionLike = details::LuaFunctional<std::decay_t<T>> || std::is_function_v<std::decay_t<T>>;
 
 template <uint64_t UniqId, typename ReturnT, typename... ArgsT>
 auto wrap_function(ReturnT (*function)(ArgsT...)) {
     return details::_wrap_function<UniqId>(native_function<decltype(function), ReturnT, ArgsT...>{function});
 }
 
-template <uint64_t UniqId, details::LuaFunctional F>
+template <uint64_t UniqId, typename F>
+    requires details::LuaFunctional<std::decay_t<F>>
 auto wrap_function(F&& function) {
-    return details::_wrap_functional<UniqId>(decltype(&F::operator()){}, function);
+    return details::_wrap_functional<UniqId>(decltype(&std::decay_t<F>::operator()){}, function);
 }
 
 namespace details
@@ -881,8 +919,8 @@ namespace details
     struct lua_function_traits<ReturnT (ClassT::*)(ArgsT...) const> : lua_function_traits<ReturnT (*)(ArgsT...)> {};
 
     template <typename F>
-        requires details::LuaFunctional<F>
-    struct lua_function_traits<F> : lua_function_traits<decltype(&F::operator())> {
+        requires details::LuaFunctional<std::decay_t<F>>
+    struct lua_function_traits<F> : lua_function_traits<decltype(&std::decay_t<F>::operator())> {
     };
 
     template <typename T>
